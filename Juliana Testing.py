@@ -12,8 +12,8 @@ from openpyxl.utils import get_column_letter
 # ──────────────────────────────────────────────────────────────────────────────
 # Streamlit chrome
 # ──────────────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="uKids — Kids Scheduler (Positions M/E)", layout="wide")
-st.title("uKids — Kids Scheduler (Positions M/E)")
+st.set_page_config(page_title="uKids — Kids Scheduler (Matches Your CSVs)", layout="wide")
+st.title("uKids — Kids Scheduler (Matches Your CSVs)")
 
 st.markdown(
     """
@@ -51,7 +51,7 @@ MONTH_ALIASES = {
     "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
     "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
 }
-YES_SET = {"yes", "y", "true", "available"}
+YES_SET = {"yes", "y", "true", "available", "1", "x", "✓", "ok", "okay"}
 
 def normalize(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(s).lower()).strip()
@@ -83,8 +83,8 @@ CAP_PATTERNS = [
     re.compile(r"^(?P<base>.*?)[\s\-]*x\s*(?P<n>\d+)\s*$", re.IGNORECASE),
 ]
 
-def parse_role_meta(header: str):
-    """Return (base_label, capacity:int). Accepts '(xN)', 'xN', or '[xN]'."""
+def parse_role_meta(header: str, default_cap: int):
+    """Return (base_label, session, capacity:int) from a header like 'Kids Production M (x4)'. Session is 'Morning'/'Evening'/'Both'."""
     s = str(header).replace("\u00A0", " ").replace("×", "x").strip()
     base = s
     cap = None
@@ -95,8 +95,24 @@ def parse_role_meta(header: str):
             cap = int(m.group("n"))
             break
     if cap is None:
-        cap = 9999  # default large cap if omitted
-    return base, cap
+        cap = default_cap
+
+    nb = normalize(base)
+    session = "Both"
+    label = base
+    if nb.endswith(" m") or nb.endswith(" morning"):
+        session = "Morning"
+        label = base.rsplit(" ", 1)[0] if " " in base else base
+    elif nb.endswith(" e") or nb.endswith(" evening"):
+        session = "Evening"
+        label = base.rsplit(" ", 1)[0] if " " in base else base
+    return label.strip(), session, cap
+
+def truthy_cell(x) -> bool:
+    s = str(x).strip().lower()
+    if s == "" or s == "nan":
+        return False
+    return (s in YES_SET)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Date/session parsing from Kids Availability CSV
@@ -165,18 +181,22 @@ def detect_date_session_headers(df: pd.DataFrame):
 st.subheader("1) Upload files")
 c1, c2 = st.columns(2)
 with c1:
-    positions_file = st.file_uploader("Serving positions (CSV)", type=["csv"], key="positions_csv")
+    positions_file = st.file_uploader("Kids Serving Positions (CSV)", type=["csv"], key="positions_csv")
 with c2:
-    kids_file = st.file_uploader("Kids availability (CSV)", type=["csv"], key="kids_csv")
+    responses_file = st.file_uploader("Kids responses (CSV)", type=["csv"], key="responses_csv")
 
-st.caption("• Positions CSV: one column per position+service. Examples: 'Kids Production M (x4)', 'Kids Production E (x3)', 'Check-in M (x6)'.")
-st.caption("• Kids CSV: columns = Name (required), optional Campus, optional 'Evening Allowed' (Yes/No), then date columns like '5 Oct Morning' / '5 Oct Evening' (or '... M' / '... E').")
+st.caption("• Positions CSV *like yours*: has 'Kids name', 'Parent Name', then columns per position, e.g. 'Kids Production M', 'Kids Production E', ... Optional capacity in headers: (xN).")
+st.caption("• Responses CSV: has 'Kids name' + availability columns like '5 October Morning', '5 October Evening', '12 Oct Morning', '12 Oct Evening', ...")
 
 st.subheader("2) Rules")
+default_capacity = st.number_input("Default capacity for positions WITHOUT (xN)", min_value=1, max_value=50, value=3, step=1)
 max_serves = st.number_input("Max serves per kid (this month)", min_value=1, max_value=20, value=4, step=1)
 
+# Optional Evening Allowed override
+st.caption("Tip: Add an 'Evening Allowed' column in Responses CSV with Yes/No to block evenings for specific kids (defaults to Yes if missing).")
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Scheduling logic (positions + sessions)
+# Scheduling logic (positions + sessions) — **matches your CSVs**
 # ──────────────────────────────────────────────────────────────────────────────
 def excel_autofit(ws):
     for col_idx, column_cells in enumerate(
@@ -188,202 +208,249 @@ def excel_autofit(ws):
             max_len = max(max_len, len(val))
         ws.column_dimensions[get_column_letter(col_idx)].width = min(max(12, max_len + 2), 80)
 
-def parse_positions(df_positions: pd.DataFrame):
+def detect_name_cols(cols):
+    cols_map = {normalize(c): c for c in cols}
+    kid_name = cols_map.get("kids name") or cols_map.get("name") or list(cols)[0]
+    parent_name = cols_map.get("parent name")
+    return kid_name, parent_name
+
+def parse_positions_and_eligibility(positions_df: pd.DataFrame, default_cap: int):
     """
-    Headers like 'Kids Production M (x4)' / 'Kids Production E (x3)' / 'Check-in M'.
-    Returns: list of (display_label, session, capacity) where session ∈ {"Morning","Evening","Both"}.
+    Your Positions CSV has kid rows and many columns for positions.
+    We:
+      - Detect kid name column
+      - Identify position columns (end with ' M'/' E' or 'Morning'/'Evening')
+      - Read capacity from header (xN) else default_cap
+      - Build per-kid eligibility for each session-specific position
+    Returns:
+      positions: list of (display_label, session, capacity)
+      eligibility: {kid_key: set(display_label_for_session)}  # e.g., 'Kids Production (Morning)'
+      name_map: {kid_key: display_name}
+      parent_map: {kid_key: parent_name or ""}
     """
-    positions = []
-    for col in df_positions.columns:
-        base, cap = parse_role_meta(col)
-        nb = normalize(base)
-        # Determine session by suffix
-        if nb.endswith(" m") or nb.endswith(" morning"):
-            session = "Morning"
-            label = base.rsplit(" ", 1)[0] if " " in base else base
-        elif nb.endswith(" e") or nb.endswith(" evening"):
-            session = "Evening"
-            label = base.rsplit(" ", 1)[0] if " " in base else base
+    kid_name_col, parent_name_col = detect_name_cols(positions_df.columns)
+
+    # Which columns are positions?
+    pos_cols = []
+    for c in positions_df.columns:
+        if c == kid_name_col or c == parent_name_col:
+            continue
+        s = str(c).strip()
+        if re.search(r"(?:\s|^)(M|E|Morning|Evening)\s*(?:\(|$)", s, re.IGNORECASE) or s.lower().endswith((" m", " e", " morning", " evening")):
+            pos_cols.append(c)
         else:
-            session = "Both"
-            label = base
-        positions.append((label.strip(), session, int(cap)))
-    positions = [(lbl, sess, cap) for (lbl, sess, cap) in positions if lbl]
-    if not positions:
-        st.error("No position columns detected. Use headers like 'Kids Production M (x4)' or 'Kids Production E (x3)'.")
-        st.stop()
-    return positions
+            # ignore other columns silently
+            pass
 
-def build_kids(kids_df: pd.DataFrame):
-    # Required: Name. Optional: Campus, Evening Allowed
-    cols = {normalize(c): c for c in kids_df.columns}
-    name_col = cols.get("name") or list(kids_df.columns)[0]
-    campus_col = cols.get("campus") or cols.get("location")
-    evening_allowed_col = cols.get("evening allowed") or cols.get("evening_allowed") or cols.get("allowed evening")
+    # Build positions list (unique by base label + session)
+    positions = []
+    seen_pos = set()
+    for c in pos_cols:
+        label, sess, cap = parse_role_meta(c, default_cap)
+        # Create display label with explicit session for clarity
+        display = f"{label} ({'Morning' if sess=='Morning' else 'Evening' if sess=='Evening' else 'Both'})"
+        # If 'Both', split into two session-specific displays for roster rows
+        if sess == "Both":
+            for s2 in ("Morning", "Evening"):
+                key = (f"{label} ({s2})", s2, cap)
+                if key not in seen_pos:
+                    positions.append(key)
+                    seen_pos.add(key)
+        else:
+            key = (f"{label} ({sess})", sess, cap)
+            if key not in seen_pos:
+                positions.append(key)
+                seen_pos.add(key)
 
-    def truthy(x):
-        return str(x).strip().lower() in YES_SET
+    # Per-kid eligibility
+    def norm_session_token(h):
+        nb = normalize(h)
+        if nb.endswith(" m") or nb.endswith(" morning"):
+            return "Morning"
+        if nb.endswith(" e") or nb.endswith(" evening"):
+            return "Evening"
+        return "Both"
 
-    kids = []
-    for _, r in kids_df.iterrows():
-        name = str(r.get(name_col, "")).strip()
-        if not name or str(name).lower() == "nan":
+    name_map, parent_map, eligibility = {}, {}, defaultdict(set)
+    for _, row in positions_df.iterrows():
+        kid_disp = str(row.get(kid_name_col, "")).strip()
+        if not kid_disp:
             continue
-        campus = str(r.get(campus_col, "")).strip() if campus_col else ""
-        evening_ok = truthy(r.get(evening_allowed_col, "yes")) if evening_allowed_col else True
-        kids.append({"name": name, "campus": campus, "evening_ok": evening_ok})
-    if not kids:
-        st.error("No kids parsed from the CSV (check Name column).")
-        st.stop()
-    return kids
+        key = normalize(kid_disp)
+        name_map[key] = kid_disp
+        parent_map[key] = (str(row.get(parent_name_col, "")).strip() if parent_name_col else "")
 
-def parse_availability(kids_df: pd.DataFrame):
-    date_map, service_slots, sheet_name = detect_date_session_headers(kids_df)
+        # For each position column, if cell truthy → eligible for that session
+        for c in pos_cols:
+            if not truthy_cell(row.get(c, "")):
+                continue
+            label, sess, _cap = parse_role_meta(c, default_cap)
+            if sess == "Both":
+                eligibility[key].add(f"{label} (Morning)")
+                eligibility[key].add(f"{label} (Evening)")
+            else:
+                eligibility[key].add(f"{label} ({sess})")
 
-    # Availability dict: {name_norm: {(date, session): True/False}}
+    # Sort positions by name then session
+    positions.sort(key=lambda t: (normalize(t[0]), t[1]))
+    return positions, eligibility, name_map, parent_map
+
+def parse_availability(responses_df: pd.DataFrame):
+    # Name column(s)
+    kid_name_col, parent_name_col = detect_name_cols(responses_df.columns)
+
+    # Optional Evening Allowed in responses
+    cols_map = {normalize(c): c for c in responses_df.columns}
+    evening_allowed_col = cols_map.get("evening allowed") or cols_map.get("evening_allowed") or cols_map.get("allowed evening")
+
+    # Service slots from headers
+    date_map, service_slots, sheet_name = detect_date_session_headers(responses_df)
+
+    # Build availability & name maps from responses
     avail = defaultdict(dict)
+    name_map = {}
+    evening_allowed = {}
 
-    cols = {normalize(c): c for c in kids_df.columns}
-    name_col = cols.get("name") or list(kids_df.columns)[0]
-
-    for _, row in kids_df.iterrows():
-        name = str(row.get(name_col, "")).strip()
-        if not name:
+    for _, row in responses_df.iterrows():
+        kid_disp = str(row.get(kid_name_col, "")).strip()
+        if not kid_disp:
             continue
-        key = normalize(name)
+        key = normalize(kid_disp)
+        name_map[key] = kid_disp
+        if evening_allowed_col:
+            evening_allowed[key] = str(row.get(evening_allowed_col, "yes")).strip().lower() in YES_SET
+        else:
+            evening_allowed[key] = True
+
         for col, slot in date_map.items():
             ans = str(row.get(col, "")).strip().lower()
-            avail[key][slot] = ans in YES_SET
+            avail[key][slot] = (ans in YES_SET)
 
-    return avail, service_slots, sheet_name
+    return avail, evening_allowed, name_map, service_slots, sheet_name
 
-def assign_kids(positions, kids, availability, service_slots, max_serves=4):
+def assign_kids(positions, eligibility, availability, evening_allowed, service_slots, max_serves=4):
     """
-    positions: list of (label, session, capacity)
-    kids: list of {name, campus, evening_ok}
-    availability: {name_norm: {(date, session): bool}}
+    positions: list of (display_label, session, capacity) — session is 'Morning' or 'Evening'
+    eligibility: {kid_key: set(display_label_for_session)}
+    availability: {kid_key: {(date, session): bool}}
+    evening_allowed: {kid_key: bool}
     service_slots: list of (date, session)
 
     Rules:
+      - Kid must be eligible for that position/session
+      - Kid must be available for that (date, session)
       - Max total assignments per kid = max_serves
-      - Never assign the same kid twice on the same calendar date (even across sessions)
-      - Respect Evening Allowed
-    Returns: schedule dict and unscheduled list per slot.
+      - Never assign the same kid twice on the same calendar date (across sessions/positions)
+      - If Evening Allowed is False → cannot take Evening slots
     """
-    kids_by_key = {normalize(k["name"]): k for k in kids}
-
-    # Expand 'Both' into explicit sessions for display and assignment
-    expanded = []  # (display_label, session, capacity)
-    for (label, sess, cap) in positions:
-        if sess == "Both":
-            expanded.append((f"{label} (Morning)", "Morning", cap))
-            expanded.append((f"{label} (Evening)", "Evening", cap))
-        else:
-            expanded.append((f"{label} ({sess})", sess, cap))
-
-    # (display_label, (date, session)) → [names]
-    schedule = {(disp, slot): [] for (disp, sess, _c) in expanded for slot in service_slots if slot[1] == sess}
+    # Build quick kid list (union from eligibility & availability)
+    kid_keys = sorted(set(list(eligibility.keys()) + list(availability.keys())))
+    # (position_display, (date, session)) → [kid display names]
+    schedule = {(disp, slot): [] for (disp, sess, _c) in positions for slot in service_slots if slot[1] == sess}
     unscheduled = {slot: [] for slot in service_slots}
 
-    # Global bookkeeping to enforce per-kid caps and per-date uniqueness
-    assigned_total = defaultdict(int)     # key -> total assignments so far
-    assigned_on_date = set()              # {(key, date)} pairs
+    assigned_total = defaultdict(int)   # per month
+    assigned_on_date = set()            # (kid_key, date)
 
-    # Deterministic order for fairness
-    kid_keys_sorted = sorted(kids_by_key.keys())
+    # Fairness: rotate by (assigned_total, name)
+    def kid_sort_key(k): return (assigned_total[k], k)
 
-    # Iterate slots chronologically; enforce daily uniqueness across sessions
     for slot in service_slots:
         d, sess = slot
         assigned_this_slot = set()
 
-        # positions for this session
-        for (disp, class_sess, cap) in [p for p in expanded if p[1] == sess]:
-            for key in kid_keys_sorted:
-                if key in assigned_this_slot:
+        # Positions for this session
+        session_positions = [(disp, sess2, cap) for (disp, sess2, cap) in positions if sess2 == sess]
+
+        for (disp, sess2, cap) in session_positions:
+            # candidates: eligible + available + evening ok + not already serving date + under cap
+            candidates = []
+            for key in kid_keys:
+                if key in assigned_this_slot:            # slot-unique
                     continue
-                if assigned_total[key] >= max_serves:
-                    continue  # monthly cap reached
-                if (key, d) in assigned_on_date:
-                    continue  # already serving this date in another session/position
+                if assigned_total[key] >= max_serves:    # monthly cap
+                    continue
+                if (key, d) in assigned_on_date:         # not twice same day
+                    continue
+                if disp not in eligibility.get(key, set()):
+                    continue
                 if not availability.get(key, {}).get(slot, False):
                     continue
-                k = kids_by_key[key]
-                if sess == "Evening" and not k.get("evening_ok", True):
-                    continue  # respect evening restriction
-                if len(schedule[(disp, slot)]) >= cap:
+                if sess == "Evening" and not evening_allowed.get(key, True):
                     continue
+                candidates.append(key)
 
-                # Assign
-                schedule[(disp, slot)].append(k["name"])  # keep display casing
-                assigned_this_slot.add(key)
-                assigned_total[key] += 1
-                assigned_on_date.add((key, d))
+            # Fairness order
+            candidates.sort(key=kid_sort_key)
 
-        # Unscheduled = said yes for this slot but not assigned
-        yes_keys = [key for key in availability.keys() if availability.get(key, {}).get(slot, False)]
-        for key in yes_keys:
+            while candidates and len(schedule[(disp, slot)]) < cap:
+                chosen = candidates.pop(0)
+                schedule[(disp, slot)].append(chosen)    # temporarily store key; convert to names later
+                assigned_this_slot.add(chosen)
+                assigned_total[chosen] += 1
+                assigned_on_date.add((chosen, d))
+
+        # Anyone who said YES for this slot but not assigned → unscheduled
+        for key in [k for k in kid_keys if availability.get(k, {}).get(slot, False)]:
             if key not in assigned_this_slot:
-                unscheduled[slot].append(kids_by_key[key])
+                unscheduled[slot].append(key)
 
     return schedule, unscheduled
 
-def schedule_to_df(schedule, service_slots):
+def schedule_to_df(schedule, service_slots, name_map):
     cols = [f"{d.strftime('%Y-%m-%d')} ({s})" for (d, s) in service_slots]
     rows = sorted({disp for (disp, _slot) in schedule.keys()})
     df = pd.DataFrame(index=rows, columns=cols)
     for (disp, slot), kids in schedule.items():
         d, s = slot
-        df.loc[disp, f"{d.strftime('%Y-%m-%d')} ({s})"] = ", ".join(kids)
+        names = [name_map.get(k, k) for k in kids]
+        df.loc[disp, f"{d.strftime('%Y-%m-%d')} ({s})"] = ", ".join(names)
     return df.fillna("")
 
-def unscheduled_to_df(unscheduled, service_slots):
+def unscheduled_to_df(unscheduled, service_slots, name_map):
     per_slot_names = {}
-    per_slot_meta = {}
     for (d, s) in service_slots:
-        entries = unscheduled.get((d, s), [])
-        entries = sorted(entries, key=lambda k: (k.get("campus", ""), normalize(k["name"])))
-        per_slot_names[(d, s)] = [e["name"] for e in entries]
-        tags = []
-        for e in entries:
-            tag = ("Evening not allowed — " if (s == "Evening" and not e.get("evening_ok", True)) else "")
-            campus = f", {e['campus']}" if e.get('campus') else ""
-            tags.append(tag + campus)
-        per_slot_meta[(d, s)] = tags
+        keys = sorted(unscheduled.get((d, s), []))
+        per_slot_names[(d, s)] = [name_map.get(k, k) for k in keys]
 
     max_len = max((len(v) for v in per_slot_names.values()), default=0)
     data = {}
     for (d, s) in service_slots:
         key = f"{d.strftime('%Y-%m-%d')} ({s})"
-        names_list = per_slot_names[(d, s)] + [""] * (max_len - len(per_slot_names[(d, s)]))
-        meta_list = per_slot_meta[(d, s)] + [""] * (max_len - len(per_slot_meta[(d, s)]))
-        data[key] = names_list
-        data[f"{key} info"] = meta_list
+        data[key] = per_slot_names[(d, s)] + [""] * (max_len - len(per_slot_names[(d, s)]))
     return pd.DataFrame(data)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Run
 # ──────────────────────────────────────────────────────────────────────────────
 if st.button("Generate Kids Schedule", type="primary"):
-    if not positions_file or not kids_file:
-        st.error("Please upload the Positions and Kids CSV files.")
+    if not positions_file or not responses_file:
+        st.error("Please upload the Positions and Responses CSV files.")
         st.stop()
 
     positions_df = read_csv_robust(positions_file, "positions")
-    kids_df = read_csv_robust(kids_file, "kids")
+    responses_df = read_csv_robust(responses_file, "responses")
 
-    positions = parse_positions(positions_df)
-    kids = build_kids(kids_df)
-    availability, service_slots, sheet_name = parse_availability(kids_df)
+    # Parse positions + eligibility from your Positions CSV
+    positions, eligibility, name_map_positions, parent_map = parse_positions_and_eligibility(positions_df, default_cap=default_capacity)
 
-    schedule, unscheduled = assign_kids(positions, kids, availability, service_slots, max_serves=max_serves)
+    # Parse availability from your Responses CSV
+    availability, evening_allowed, name_map_responses, service_slots, sheet_name = parse_availability(responses_df)
 
-    schedule_df = schedule_to_df(schedule, service_slots)
-    unscheduled_df = unscheduled_to_df(unscheduled, service_slots)
+    # Merge display names (prefer positions casing; fall back to responses)
+    name_map = {**name_map_responses, **name_map_positions, **name_map_responses}
 
-    # Stats (count actual valid position×slot cells via schedule keys)
+    # Assign with rules
+    schedule, unscheduled = assign_kids(
+        positions, eligibility, availability, evening_allowed, service_slots, max_serves=max_serves
+    )
+
+    schedule_df = schedule_to_df(schedule, service_slots, name_map)
+    unscheduled_df = unscheduled_to_df(unscheduled, service_slots, name_map)
+
+    # Stats (cells that have at least one kid)
     filled_cells = sum(1 for v in schedule.values() if len(v) > 0)
-    total_valid_cells = len(schedule)  # each key is a valid (position, slot) combination
+    total_valid_cells = len(schedule)
     total_kids_scheduled = sum(len(v) for v in schedule.values())
 
     st.success(f"Schedule generated for **{sheet_name}**")
@@ -392,23 +459,12 @@ if st.button("Generate Kids Schedule", type="primary"):
     st.subheader("Rosters (Position × Service)")
     st.dataframe(schedule_df, use_container_width=True)
 
-    st.subheader("Unscheduled but Available — by Service (Name + Info)")
-    st.caption("Kids who said Yes for that service but were not placed (capacity reached, already serving that day, evening restriction, or monthly cap).")
+    st.subheader("Unscheduled but Available — by Service")
+    st.caption("Kids who said Yes for that service but were not placed (capacity reached, daily rule, evening rule, or monthly cap).")
     st.dataframe(unscheduled_df, use_container_width=True)
 
     # Excel export
-    def excel_autofit(ws):
-        for col_idx, column_cells in enumerate(
-            ws.iter_cols(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column), start=1
-        ):
-            max_len = 0
-            for cell in column_cells:
-                val = "" if cell.value is None else str(cell.value)
-                max_len = max(max_len, len(val))
-            ws.column_dimensions[get_column_letter(col_idx)].width = min(max(12, max_len + 2), 80)
-
     wb = Workbook()
-    # Remove default sheet
     if wb.active and wb.active.title == "Sheet":
         wb.remove(wb.active)
     ws = wb.create_sheet(sheet_name)
@@ -417,16 +473,15 @@ if st.button("Generate Kids Schedule", type="primary"):
     ws.append(header)
     row_labels = sorted({disp for (disp, _slot) in schedule.keys()})
     for disp in row_labels:
-        ws.append([disp] + [", ".join(schedule.get((disp, (d, s)), [])) for (d, s) in service_slots])
+        vals = []
+        for (d, s) in service_slots:
+            names = [name_map.get(k, k) for k in schedule.get((disp, (d, s)), [])]
+            vals.append(", ".join(names))
+        ws.append([disp] + vals)
     excel_autofit(ws)
 
     ws2 = wb.create_sheet("Unscheduled by Service")
-    header_pairs = []
-    for (d, s) in service_slots:
-        ds = f"{d.strftime('%Y-%m-%d')} ({s})"
-        header_pairs.extend([ds, f"{ds} info"])
-    ws2.append([" "] + header_pairs)
-
+    ws2.append([" "] + [f"{d.strftime('%Y-%m-%d')} ({s})" for (d, s) in service_slots])
     for i in range(unscheduled_df.shape[0]):
         ws2.append([i + 1] + [unscheduled_df.iloc[i, j] for j in range(unscheduled_df.shape[1])])
     excel_autofit(ws2)
@@ -441,5 +496,5 @@ if st.button("Generate Kids Schedule", type="primary"):
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 else:
-    st.info("Upload Positions + Kids CSVs, set rules, then click **Generate Kids Schedule**.")
+    st.info("Upload your **Kids Serving Positions** CSV and **Kids responses** CSV, set rules, then click **Generate Kids Schedule**.")
 
